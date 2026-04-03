@@ -1,47 +1,50 @@
-# project4_UseComputer
 
-# usecomputer: Design Architecture Analysis
 
-## Repository Overview
+# Project 4 Reverse Engineering Report: usecomputer
 
-**Project:** usecomputer  
-**GitHub:** https://github.com/remorses/usecomputer  
-**Description:** Fast computer automation CLI for AI agents. Control any desktop with accessibility snapshots, clicks, typing, scrolling, and more.  
-**Language Stack:** Zig (55.8%) + TypeScript (44.2%)  
+*   **Project Name:** usecomputer
+*   **Repository:** [https://github.com/remorses/usecomputer](https://github.com/remorses/usecomputer)
+*   **Project Category:** Desktop Automation CLI / Native Systems Tooling
+*   **Date of Submission:** April 3rd, 2026
 
----
+## 1. Project Overview and Key Components
 
-## Q1: Why null normalization is necessary for JavaScript-to-Zig communication
+### Repository Analysis Summary
 
-### Evidence from Repository
-The README explicitly states:
-> "These exported functions intentionally mirror the native command shapes used by the Zig N-API module. **Optional native fields are passed as null when absent.**"
+`usecomputer` is a desktop automation tool built for agent-style workflows. At a high level, it gives an LLM or a script the same small set of actions a human would need to operate a machine: take a screenshot, move the mouse, click, drag, scroll, type text, press shortcuts, and inspect the current display or window state.
 
-### Answer
-Null normalization serves as a **type boundary enforcement mechanism** between JavaScript's `undefined` and Zig's strictly-typed optional system.
+What makes the repository interesting is the way it splits responsibilities. The public TypeScript layer is intentionally thin. Files like `src/lib.ts`, `src/bridge.ts`, and `src/coord-map.ts` provide a typed, stable interface for JavaScript consumers, but the real work happens in Zig. The native layer in `zig/src/lib.zig` talks directly to platform APIs on macOS, Linux, and Windows, and the CLI in `zig/src/main.zig` uses that same native core instead of re-implementing the commands separately.
 
-**Technical Rationale:**
+There are a few design choices that show up across the whole repository:
 
-1. **Type System Mismatch Resolution**
-   - JavaScript distinguishes between `undefined` (unset) and `null` (explicitly empty)
-   - Zig's N-API binding requires explicit null markers for optional parameters
-   - The bridge.ts layer converts `undefined` → `null` to create a **canonical representation** that Zig's FFI layer can reliably detect
+*   The package prefers explicit operations over generic command execution.
+*   The JavaScript side normalizes inputs before they ever cross into native code.
+*   Screenshots are treated as part of an agent loop, not just as raw image files.
+*   Coordinate mapping is treated as a safety problem, not just a geometry problem.
 
-2. **Prevents Hidden Allocations**
-   - Zig design principle: "No hidden memory allocations"
-   - By normalizing all empty optionals to `null`, the native code knows exactly which pointers to ignore without runtime type-checking
-   - Example from library: `await usecomputer.screenshot({ path: './tmp/shot.png', display: null, window: null, region: null, annotate: null })`
-   - Each `null` explicitly tells Zig: "do not allocate resources for this parameter"
+In practice, that gives the project a fairly disciplined architecture:
 
-3. **Error Prevention for AI Agents**
-   - Agents might accidentally pass `undefined` for image annotations or region bounds
-   - Without normalization, undefined would cause **memory corruption** or undefined behavior at the C-ABI boundary
-   - Normalization ensures the N-API wrapper rejects ambiguous inputs before they reach native code
+*   `src/native-lib.ts` loads the platform-specific `.node` addon.
+*   `src/bridge.ts` converts TypeScript calls into native-friendly payloads and unwraps native results into real exceptions.
+*   `src/lib.ts` exposes the library API with safe defaults.
+*   `src/coord-map.ts` handles the conversion between screenshot-space and desktop-space coordinates.
+*   `zig/src/lib.zig` implements the native automation logic and returns structured success/error objects.
+*   `zig/src/main.zig` provides the standalone CLI using the same core functions.
+*   `zig/src/kitty-graphics.zig` adds inline screenshot delivery for agent environments that support Kitty Graphics.
 
-4. **Deterministic Behavior**
-   - Zig values determinism and explicit control flow
-   - Normalizing to null provides a single code path for "absent value" handling rather than checking both `null` and `undefined`
+The overall design is practical rather than abstract. The repository is not trying to be a generic automation framework with plugins and dynamic dispatch. It is trying to be a reliable execution layer for computer-use agents, and most of the safety decisions in the code follow directly from that goal.
 
+## 2. Deep Reasoning Questions & Analysis
+
+### Q1. `usecomputer`'s `bridge.ts` converts undefined values to null before sending to native code. Why is this null normalization necessary for JavaScript-to-Zig communication?
+
+This normalization is there to make the boundary between JavaScript and Zig predictable.
+
+On the TypeScript side, callers naturally omit optional values or leave them as `undefined`. On the Zig side, the input structs are built around explicit optionals with `null` defaults. Those are not quite the same thing. Inside regular JavaScript code, `undefined` and `null` are often treated interchangeably, but once values cross a native boundary that assumption becomes dangerous. A missing property, an `undefined` value, and an explicit `null` do not necessarily marshal the same way through N-API.
+
+`bridge.ts` solves that by converting every absent optional field into a single concrete representation before it reaches native code. In other words, it turns "maybe omitted" into "explicitly empty." That matters because the Zig layer is written to interpret absence through `null`, not through JavaScript object shape quirks.
+
+The important point is that this is not cosmetic cleanup. It is contract stabilization. By the time the request reaches the Zig addon, there is only one meaning for "no value provided," so the native code can keep its logic simple and deterministic.
 ### Related Code Pattern
 ```javascript
 // From README examples - all optional fields normalized to null:
@@ -54,49 +57,20 @@ const screenshot = await usecomputer.screenshot({
 })
 ```
 
----
+### Q2. `usecomputer` normalizes all mouse button operations through `unwrap*` helper functions instead of having each method handle errors directly. Why does this centralized error pattern prevent user code from mishandling failures?
 
-## Q2: Why unwrap* helper functions prevent user code from mishandling failures
+The big advantage is that it prevents partial handling and silent failure.
 
-### Evidence from Repository
-The architecture document notes that commands like `click`, `scroll`, `press`, and `typeText` use **centralized error handling patterns** rather than letting each method handle errors independently.
+The Zig layer returns structured result objects like `{ ok, error }` or `{ ok, data, error }`. If those raw objects were exposed directly to every JavaScript caller, then every caller would have to remember to check `ok`, inspect `error`, and convert failures into real control flow. In practice, some code would do that carefully and some code would not. That is exactly how automation code ends up continuing after a failed click or drag.
 
-### Answer
-Centralized unwrap-like error handling prevents **silent failures and inconsistent error semantics** that plague AI agent code.
+The bridge does not allow that. `unwrapCommand` and `unwrapData` convert the native result into one of two outcomes only:
 
-**Design Pattern Benefits:**
+*   success returns the expected value, or
+*   failure throws a `NativeBridgeError`.
 
-1. **Single Error Semantics for All Operations**
-   - Each of the 18 exported functions (click, drag, type, scroll, etc.) routes errors through identical unwrap logic
-   - If a click fails due to Zig's N-API error, the error is thrown in the same way as a scroll failure
-   - User code cannot accidentally `await usecomputer.click(...)` and forget to catch thrown errors
+That design matters because exceptions are hard to ignore accidentally. A caller cannot casually keep going with a failed native operation unless it deliberately catches and suppresses the exception. It also means every error leaves the bridge with the same structure and with the native command name attached, which makes debugging a lot easier.
 
-2. **Prevents Partial State Updates**
-   - Without centralized unwrap, a developer might write:
-     ```javascript
-     await usecomputer.click({ point, button: 'left', count: 1 })
-     // What if this throws? Did it move the mouse but fail to click?
-     // Did it click but fail to record the action?
-     ```
-   - Centralized unwrap ensures the Zig native code **completes atomically or fails entirely** before control returns to JavaScript
-
-3. **AI Agent Safety: Fails Fast**
-   - Agents iterate quickly through thousands of actions
-   - If a click fails silently, the agent might:
-     - Click wrong UI elements downstream
-     - Perform actions in the wrong application window
-     - Corrupt application state
-   - Centralized unwrap **throws immediately**, halting the action loop and forcing the agent to recover
-
-4. **Prevents Callback Hell**
-   - Alternative anti-pattern: each method returns `{ok: boolean, error?: Error}`
-   - Agents would need to check every response: `if (!result.ok) { ... }`
-   - Centralized unwrap makes this enforcement implicit—exceptions propagate automatically
-
-5. **Type Safety Through Throwing**
-   - The repository lists exported methods as plain async functions
-   - Each unwrap call converts Zig's error union type (`!T`) into JavaScript exceptions
-   - User code cannot accidentally ignore a return value that might be an error
+So the central helper functions are really enforcing one failure policy for the whole library. That is safer than letting each operation or each caller invent its own.
 
 ### Related Code Pattern
 ```typescript
@@ -113,55 +87,15 @@ await usecomputer.click({
 // click() wraps Zig's error union; if native click fails, throws
 ```
 
----
+### Q3. The `CoordMap` coordinate transformation uses proportional scaling with clamping rather than linear interpolation. Why does proportional scaling prevent AI agents from clicking outside the capture region?
 
-## Q3: Why proportional scaling with clamping prevents out-of-bounds clicks
+Because the screenshot the agent sees is not always the same size as the real captured desktop region.
 
-### Evidence from Repository
-README documents coordinate mapping as:
-> "usecomputer screenshot always scales the output image so the longest edge is at most 1568 px...Always pass the exact --coord-map value emitted by usecomputer screenshot to pointer commands when you are clicking coordinates from that screenshot. This maps screenshot-space coordinates back to real screen coordinates."
+`usecomputer` routinely scales screenshots down so the image stays within a model-friendly size. Once that happens, the coordinates inside the image are no longer one-to-one desktop coordinates. A point at `(400, 220)` inside the screenshot only makes sense relative to the screenshot dimensions. To recover the real desktop point, the code has to scale proportionally from image space back into capture space.
 
-> "coordMap in the form `captureX,captureY,captureWidth,captureHeight,imageWidth,imageHeight`"
+That is why the mapping uses the ratio of the point inside the screenshot span and then applies that ratio to the captured desktop span. The code also clamps the result to the capture bounds. That second step is crucial: if the model produces `-5`, or overshoots the right edge by a few pixels, or lands on a rounding boundary, the result is still forced back inside the area that was actually captured.
 
-### Answer
-Proportional scaling with clamping creates a **bounded transformation** that maps screenshot coordinates back to screen coordinates while preventing out-of-bounds click injection attacks.
-
-**Mathematical & Safety Rationale:**
-
-1. **Proportional Scaling Prevents Coordinate Overflow**
-   - Screenshot is scaled to max 1568px edge (model-friendly size)
-   - Real screen might be 1600×900 or 4000×2160 (multi-monitor)
-   - Proportional mapping: `real_x = (screenshot_x / image_width) * capture_width + capture_x`
-   - **Without clamping**: An agent that miscalculates could pass x=2000 on a 1568px image
-     - This would map to real_x = (2000/1568) * 1600 + 0 = 2038 (off-screen right edge)
-     - On a 1600px wide screen, this clicks at x=2038 (wraps to mouse movement outside capture region or causes undefined behavior)
-   
-2. **Clamping Restricts Clicks to Capture Region**
-   - The coordMap includes `captureX, captureY, captureWidth, captureHeight`
-   - These define the original screenshot bounds on the real screen
-   - Clamping algorithm (pseudocode):
-     ```
-     scaled_x = (screenshot_x / image_width) * capture_width + capture_x
-     clamped_x = max(capture_x, min(scaled_x, capture_x + capture_width))
-     ```
-   - Result: **All clicks land within the original screenshot's region**, never outside
-
-3. **Prevents AI Agent Attacks on Unscanned Areas**
-   - Imagine an agent screenshot captures coordinates [0,0] to [1600,900] at 1568px scaled size
-   - Without clamping, agent might try: `click({ x: 1568, y: 882 })` (right edge)
-   - This would map to screen [1600, 900] (off-screen corner)
-   - **Clamping redirects this to [1568, 882]** (within capture bounds)
-   - Safe: prevents agent from clicking on unscanned UI elements like system taskbars, dock, or overlays
-
-4. **Multimonitor Safety**
-   - With multiple displays, screen coordinates can be negative or far-right
-   - CoordMap anchors clicks to the specific display capture region
-   - Proportional scaling + clamping ensures cross-monitor clicks stay local to the captured display
-
-5. **Prevents Integer Overflow in Native Code**
-   - Zig code receives validated coordinates within capture_width ± 1 pixel
-   - No need for bounds checking at the C-ABI level
-   - Reduces attack surface for Zig's memory safety
+This is what keeps the action aligned with what the model could see. Without the proportional transform, scaled screenshots would map badly. Without the clamp, small coordinate mistakes would turn into clicks outside the intended region.
 
 ### Related Code Pattern
 ```javascript
@@ -180,85 +114,17 @@ const point = usecomputer.mapPointFromCoordMap({
 await usecomputer.click({ point, button: 'left', count: 1 })
 ```
 
----
+### Q4. `usecomputer` implements 18 distinct methods (`click`, `drag`, `type`, `scroll`, etc.) as separate exported functions instead of a single `execute` method with a command string. Why does method-per-operation improve safety over dynamic dispatch?
 
-## Q4: Why 18 distinct methods improve safety over a single 'execute' with command string
+Method-per-operation is safer because it makes the interface explicit, typed, and narrow.
 
-### Evidence from Repository
-README and exported API list 18 distinct functions:
-- `screenshot`
-- `click`
-- `drag`
-- `typeText`
-- `press`
-- `scroll`
-- `mouseMove`
-- `mousePosition`
-- Plus coordinate mapping helpers: `mapPointFromCoordMap`, `parseCoordMapOrThrow`
-- Plus CLI-equivalents for all above
+Each exported function has a known payload shape, known defaults, and known validation rules. `click` accepts a point, button, and count. `scroll` accepts a direction and amount. `drag` accepts `from`, `to`, and an optional control point. That sounds simple, but it has a real effect on safety: invalid combinations are harder to express in the first place.
 
-Repository states:
-> "These exported functions intentionally mirror the native command shapes used by the Zig N-API module."
+If the whole system were reduced to something like `execute("click", payload)` or worse, `execute(commandString)`, then correctness would depend on runtime parsing and convention. That would make it easier for generated code to send fields that do not belong together, miss required fields, invent unsupported commands, or bypass command-specific checks.
 
-### Answer
-Method-per-operation design provides **compile-time type safety and prevents injection attacks** compared to dynamic dispatch via command strings.
+The current design removes that ambiguity. On the Zig side, the N-API module exports named functions one by one. On the TypeScript side, the public library mirrors those functions one by one. So the surface area is deliberately fixed. A caller can only do what the library explicitly exposes.
 
-**Safety & Design Benefits:**
-
-1. **Type Safety at Compile Time**
-   ```typescript
-   // Method-per-operation (current design):
-   await usecomputer.click({ point: {x: 400, y: 220}, button: 'left', count: 1 })
-   // TypeScript enforces: point is required, button must be 'left'|'middle'|'right'
-   
-   // vs. Dynamic dispatch (hypothetical dangerous pattern):
-   await usecomputer.execute({
-     action: 'click',
-     // Agent could malform this: action: 'click; rm -rf /'  (pseudo-injection)
-     params: '{"point": [400, 220], "button": "left"}'
-   })
-   // Parser must validate 'action' string, 'button' string, everything at runtime
-   ```
-
-2. **Prevents Command Injection**
-   - With string-based dispatch, agents could attempt:
-     ```javascript
-     await usecomputer.execute({
-       command: 'click -x 400 -y 220 --button left; screenshot --save /tmp/malicious'
-     })
-     ```
-   - Method-per-operation: `usecomputer.click()` is a JS function, not a shell command parser
-   - No shell interpretation, no injection surface
-
-3. **Explicit Parameter Contracts**
-   - Each method signature declares required/optional parameters upfront
-   - TypeScript disallows: `usecomputer.click()` (missing point)
-   - TypeScript disallows: `usecomputer.scroll({ direction: 'diagonal' })` (invalid direction)
-   - Runtime validation becomes optional—type system enforces contracts
-
-4. **Atomic Failure Modes**
-   - A single typo in string command: `execute('clikc ...')` silently fails or runs wrong command
-   - A typo in method call: `usecomputer.clikc()` raises "not a function" immediately at parse time
-   - No silent misrouting
-
-5. **Performance: No String Parsing**
-   - String-based dispatch requires:
-     1. Parse command name
-     2. Validate command name against list
-     3. Parse parameters JSON/text
-     4. Validate each parameter
-   - Method-per-operation: Direct function call, JavaScript VM dispatches at call site
-   - Particularly important for agents running thousands of operations/second
-
-6. **IDE Autocomplete for Agents**
-   - LLM-based agents can use JavaScript (VSCode, etc.) to verify available methods
-   - `usecomputer.` [autocomplete shows all 18 methods]
-   - String-based dispatch: Agent must remember command names from documentation
-
-7. **Bidirectional API Compatibility**
-   - CLI commands mirror method signatures
-   - `usecomputer click -x 400 -y 220` ↔ `await usecomputer.click({ point: {x: 400, y: 220} })`
-   - Single source of truth for interface contracts
+For a desktop automation tool, that is a safety feature. Fewer degrees of freedom at the interface means fewer chances to do the wrong thing with a malformed dynamic command.
 
 ### Related Code Pattern
 ```javascript
@@ -273,61 +139,28 @@ await usecomputer.scroll({ direction: 'up', amount: 5, at: null })
 // All errors are thrown consistently (via unwrap pattern from Q2)
 ```
 
----
+### Q5. Why does `usecomputer` require a native Zig binary (built via `pnpm build:native` or `zig build`) instead of implementing desktop automation in pure JavaScript?
 
-## Q5: Why native Zig binary is required instead of pure JavaScript
+Because the core problem is not JavaScript-friendly. It is operating-system automation.
 
-### Evidence from Repository
-- Repository contains both `src/` (TypeScript) and `zig/src/` (Zig source)
-- README: "Screenshot, mouse control...are all available as CLI commands backed by a **native Zig binary** — no Node.js runtime required"
-- Build instructions: `pnpm build:native` or `zig build`
-- Release notes mention: "Standalone executable — ships as a self-contained binary, no Node.js required at runtime"
+The repository needs to do things like:
 
-### Answer
-JavaScript cannot implement desktop automation at the system level; native code is **mandatory** for hardware access and performance-critical screen capture.
+*   synthesize real mouse and keyboard events,
+*   capture screenshots from the desktop,
+*   enumerate displays and windows,
+*   talk to CoreGraphics on macOS,
+*   talk to X11/XTest on Linux,
+*   talk to `user32` and `gdi32` on Windows.
 
-**Technical Requirements:**
+Pure JavaScript cannot do those jobs by itself in a portable and reliable way. At some point it must call native APIs, shell out to platform utilities, or depend on another native binding. `usecomputer` chooses to own that layer directly in Zig rather than hide it behind a heavier JavaScript abstraction.
 
-1. **Hardware Access & OS Privileges**
-   - JavaScript (Node.js/Bun) runs in a sandbox with restricted system calls
-   - **Screen capture** requires:
-     - macOS: Quartz framework APIs (CoreGraphics)
-     - Linux: X11 Shm (XShm) or XGetImage syscalls
-     - Windows: GDI+ or DXGI for framebuffer access
-   - These are C-level APIs; JavaScript cannot call them directly
-   - Zig links to native frameworks: `libpng` for image encoding, XShm for X11 capture
+That decision also matches the repo's deployment goals. The same build system produces:
 
-2. **Mouse & Keyboard Injection**
-   - JavaScript cannot synthesize OS-level input events
-   - **Mouse**: macOS requires Quartz events (CGEventCreate, CGEventPost)
-   - **Keyboard**: Linux X11 requires XTest extension; Windows requires SendInput syscall
-   - Node.js would need a native module wrapper anyway
-   - Zig compiles directly to these syscalls without indirection
+*   a `.node` addon for Node-based consumers,
+*   a standalone executable CLI,
+*   and a C API shared library.
 
-3. **Screenshot Performance (Latency-Critical)**
-   - Screenshot must be fast for AI agents (ideally <100ms)
-   - Full-screen capture in pure JavaScript would:
-     - Require extracting pixels via Canvas API (browser-only, no Node.js API)
-     - Or reading `/dev/fb0` on Linux (slow, requires unsafe syscalls)
-   - Zig directly calls XGetImage (Linux) or IOSurfaceMemoryBlock (macOS)
-   - **Pure JavaScript add 3-5x latency** via marshalling overhead
-
-4. **PNG Encoding Performance**
-   - Screenshot output must be PNG-encoded for AI model processing
-   - Pure JavaScript PNG encoders exist but are slow (Pako, PNG-JS)
-   - Zig links libpng (C library), 10x faster
-   - For agents taking 100 screenshots/hour, 2x encoding overhead = 30 seconds lost
-
-5. **Cross-Platform Compilation Requirement**
-   - Package is available on macOS, Linux X11, and Windows
-   - Pure JavaScript would need three separate native module dependencies (one per platform)
-   - Zig compiles to all three from a single codebase: `zig build -Dtarget=x86_64-windows`, `zig build -Dtarget=x86_64-linux-gnu`, etc.
-   - Shipping as single native binary is simpler than shipping N platform-specific .node modules
-
-6. **Distribution Without Node.js Runtime**
-   - Standalone usecomputer binary runs anywhere (no Node.js required)
-   - Pure JavaScript would require bundling Node.js runtime (~50MB)
-   - Zig binary is smaller and dependency-free
+That would be much harder to do cleanly if the real implementation lived in JavaScript and depended on a runtime everywhere.
 
 ### System Diagram (from Repository Architecture)
 ```
@@ -348,53 +181,15 @@ JavaScript cannot implement desktop automation at the system level; native code 
 └─────────────────────────────────────────┘
 ```
 
----
+### Q6. Why does `usecomputer` include both CLI and JavaScript library interfaces instead of just exposing a single API?
 
-## Q6: Why both CLI and JavaScript library interfaces exist instead of single API
+Because the repository is serving two different usage patterns that both matter.
 
-### Evidence from Repository
-- CLI commands: `usecomputer screenshot`, `usecomputer click -x 400 -y 220`, `usecomputer press "cmd+s"`
-- Library: `await usecomputer.screenshot({...})`, `await usecomputer.click({...})`
-- README explicitly shows both: "available as CLI commands" AND "export functions...you can import"
+The CLI is for direct automation in shells, scripts, and agent tool calls. It is especially useful in environments where the easiest thing is to run a command and read stdout. It also has one major practical advantage: the standalone binary can run without depending on a Node runtime.
 
-### Answer
-Dual interfaces serve different use cases: **CLI for orchestration/testing, library for agent integration**.
+The JavaScript library solves a different problem. It is for code that wants to call the tool in-process and compose it with its own control loop, which is exactly what the OpenAI and Anthropic examples in the README do. In those cases, spawning a subprocess for every mouse move, click, or screenshot would be clumsy and slower.
 
-**Design Rationale:**
-
-1. **CLI for Human Operators & Shell Scripts**
-   - DevOps engineers might debug: `usecomputer screenshot ./test.png && usecomputer debug-point -x 400 -y 220`
-   - Bash workflows: `for image in *.png; do usecomputer screenshot $image; done`
-   - Kubernetes job: `usecomputer screenshot /shared/volume/screen.png`
-   - Shell doesn't need to load Node.js runtime; CLI binary runs instantly
-
-2. **Library for AI Agents (Programmatic)**
-   - LLM agents written in Node.js/TypeScript need synchronous integration
-   - Agent imports: `import * as usecomputer from 'usecomputer'`
-   - Agent executes: `await usecomputer.click({point: {x: 400, y: 220}})`
-   - No subprocess spawn overhead; function call within same process
-
-3. **Prevents Subprocess Overhead**
-   - Alternative (library-only): agents would spawn `usecomputer screenshot` as subprocess
-   - Subprocess cost: fork process → load binary → load Zig runtime → capture → exit
-   - **Repeated subprocess spawning kills agent performance** (100 screenshots/session)
-   - Direct library calls: bypass OS process creation entirely
-
-4. **Shared Argument Parsing**
-   - CLI arguments and library function parameters are **identical**
-     - `usecomputer click -x 400 -y 220 --button left` → CLI parses to `{x: 400, y: 220, button: 'left'}`
-     - `await usecomputer.click({x: 400, y: 220, button: 'left'})` → library passes same struct to Zig
-   - **Single source of truth** for command contracts
-
-5. **Testing & Debugging Flexibility**
-   - Developers can test CLI: `usecomputer click -x 400 -y 220` and inspect exit code
-   - Then test library: `await usecomputer.click({point: {x: 400, y: 220}})`
-   - Both routes hit the same Zig native code, ensuring consistency
-
-6. **Distribution Flexibility**
-   - Systems without Node.js can use CLI (e.g., Docker containers with just the binary)
-   - Systems with Node.js can use library (e.g., Node.js-based agent platforms)
-   - Single package satisfies both use cases
+What is important is that this is not two separate implementations. The CLI and library are thin entry points over the same native core. The project is not duplicating logic; it is exposing the same capabilities in the two forms users are most likely to need.
 
 ### Related Code Pattern
 ```bash
@@ -426,59 +221,15 @@ await usecomputer.click({
 })
 ```
 
----
+### Q7. Why does `usecomputer` include both screenshot scaling and Kitty Graphics Protocol support instead of just returning raw screenshots?
 
-## Q7: Why screenshot scaling (1568px) and Kitty Graphics Protocol support exist
+Because the repository is optimized for agent loops, and raw screenshots are not enough for that workflow.
 
-### Evidence from Repository
-- README: "usecomputer screenshot always scales the output image so the longest edge is at most 1568 px. This keeps screenshots in a model-friendly size for computer-use agents."
-- README: "When the AGENT_GRAPHICS environment variable contains kitty, the screenshot command emits the PNG image inline to stdout using the Kitty Graphics Protocol."
-- Coordinate mapping: "coordMap in the form captureX,captureY,captureWidth,captureHeight,imageWidth,imageHeight"
+Screenshot scaling solves the size problem. The code caps the longest edge at 1568 pixels so screenshots stay small enough to be practical for model input. That keeps the image detailed enough to be useful while avoiding the waste of sending full native-resolution captures when the model does not need them.
 
-### Answer
-Scaling + Kitty support optimize for **AI model token budgets and agent response latency**.
+Kitty Graphics solves a different problem entirely: transport. In agent environments that support it, the screenshot command can emit the PNG inline to stdout, and a plugin can inject that image directly into the model context. That removes an extra read step and makes the screenshot available immediately in the same tool call.
 
-**Performance & UX Rationale:**
-
-1. **Screenshot Scaling: Token Budget Constraint**
-   - Full 4K screenshot: ~3840×2160 pixels → 8.3MB PNG → ~33 million pixels
-   - Vision models (Claude, GPT-4V) accept ~50KB image tokens maximum
-   - Unscaled image would consume:
-     - 33M pixels × (estimated 4-8 tokens/pixel for JPEG encoding) = 132M tokens
-     - Exceeds model context limit; image gets rejected or compressed lossy
-   - **1568px max edge** (longest) results in ~2.5M pixels:
-     - 2.5M × 4-8 tokens/pixel = 10-20M tokens (within budget for 100K context window)
-     - Maintains readability for UI elements (buttons, text) while fitting budget
-
-2. **Why 1568 Specifically?**
-   - 1568 = 2^9.28 ≈ power-of-2-ish, chosen for:
-     - Common AI model image input sizes: 1024, 1792, 2048
-     - Not too large (saves tokens); not too small (preserves text legibility at ~12px font)
-     - Empirically tested for Claude's vision model
-
-3. **Proportional Scaling Maintains Aspect Ratio**
-   - If screenshot is 1600×900: scaled to 1568×882 (maintains 16:10 ratio)
-   - If screenshot is 2560×1600: scaled to 1568×980
-   - **Preserves layout relationships** for coordinate mapping (see Q3)
-
-4. **Kitty Graphics Protocol: Inline Image Delivery**
-   - Without Kitty support: agent reads screenshot file → encodes to base64 → sends in message
-   - Kitty Graphics: agent writes escape sequence to stdout → terminal displays PNG inline → model sees native image
-   - **Zero additional context tokens** (image is rendered, not tokenized)
-   - Kitty-compatible terminals (Ghostty, some Linux terminals) understand the protocol
-
-5. **Plugin Architecture for Agent Graphics**
-   - Repository mentions: "kitty-graphics-agent, an OpenCode plugin that intercepts Kitty Graphics escape sequences"
-   - AI agents can:
-     1. Run: `usecomputer screenshot` with `AGENT_GRAPHICS=kitty`
-     2. Output includes Kitty escape sequences
-     3. Plugin intercepts and injects image into model context window
-     4. Model sees "screenshot taken" without base64 overhead
-
-6. **Backward Compatibility**
-   - Agents without Kitty support fall back to file-based screenshots
-   - README: "The JSON output includes 'agentGraphics': true when the image was emitted inline"
-   - Agents check this flag to determine how to process screenshot
+So one feature controls image size and the other controls delivery mechanism. They are solving different bottlenecks in the same loop. Returning only raw screenshots would leave both problems unsolved.
 
 ### Related Code Pattern
 ```bash
@@ -494,59 +245,16 @@ AGENT_GRAPHICS=kitty usecomputer screenshot --json
 # Model sees rendered image directly
 ```
 
----
 
-## Q8: Why debug visualization mode prevents incorrect click validation
+### Q8. Why does `usecomputer` provide a "debug visualization" mode instead of trusting agents to validate clicks correctly?
 
-### Evidence from Repository
-- README: "To validate a target before clicking, use `debug-point`. It takes the same coordinates and `--coord-map`, captures a fresh full-desktop screenshot, and draws a red marker where the click would land."
-- Command: `usecomputer debug-point -x 400 -y 220 --coord-map "0,0,1600,900,1568,882"`
+Because coordinate mistakes are cheap to make and expensive to ignore.
 
-### Answer
-Debug visualization ensures agents **catch coordinate errors before destructive actions**.
+An agent may believe it is clicking the right point, but the real target depends on several layers of transformation: display origin, screenshot scaling, optional region capture, rounding, and coordinate remapping. A human reviewer or a calling program may want proof of where the action will actually land before issuing the real click.
 
-**Safety & Developer UX:**
+That is what `debug-point` provides. It takes the same coordinate input and the same coord-map, resolves the desktop target the same way a real pointer command would, takes a fresh screenshot, and draws a marker where the click would land. In other words, it validates the actual execution path instead of validating the agent's own reasoning about that path.
 
-1. **Prevents Catastrophic Click Mistakes**
-   - Agent calculates: "I want to click the 'Save' button at (400, 220)"
-   - Without debug-point: agent calls `click` → if coordinates are wrong, document is saved to wrong location or wrong application closes
-   - With debug-point: agent can call `debug-point` first → see red marker on screenshot → verify before calling `click`
-   - **Red marker acts as assertion**: "if marker is not on 'Save' button, halt agent"
-
-2. **Detects Coordinate Mapping Errors**
-   - Agent might miscalculate coordinate transformation:
-     - Screenshot was 1568px wide, agent thinks it's 800px wide
-     - Clicks end up at x = (1568/800)*400 = 784px instead of intended 400px
-   - `debug-point` reveals this: red marker appears at x=784, agent sees mismatch, skips click
-   - Prevents silent failure mode where agent clicks wrong element
-
-3. **Validates Coordmap Parsing**
-   - If agent passes malformed `--coord-map`, click would fail at Zig level
-   - `debug-point` is lightweight (draws marker, no destructive action)
-   - Agent can validate coordmap without side effects
-
-4. **Provides Visual Feedback in Loop**
-   - Agent loop:
-     ```
-     1. screenshot → get coordMap
-     2. analyze screenshot → find button at (x, y)
-     3. [OPTIONAL] debug-point → validate coordinates
-     4. if debug_marker_matches_button: click else: retry
-     ```
-   - Without debug-point: agent must trust coordinate math; errors cause failures many steps later
-
-5. **Cost-Benefit: Cheap Validation**
-   - `debug-point` only draws a marker (1-2ms overhead)
-   - Compared to `click` which is permanent/destructive, this is negligible
-   - Agents can afford to debug-point before every critical click
-
-6. **Human Developer Debugging**
-   - Developers writing agent workflows can run:
-     ```bash
-     usecomputer debug-point -x 400 -y 220 --coord-map "0,0,1600,900,1568,882"
-     # Opens screenshot with red marker, human verifies visually
-     ```
-   - Faster than running full agent, inspecting logs, finding issue
+That is a sensible safeguard in an automation tool. If the system already knows how to reconstruct the real click target, it is better to visualize it than to trust that the caller got the geometry right.
 
 ### Related Code Pattern
 ```javascript
@@ -570,49 +278,15 @@ if (isMarkerOnTarget(debugScreenshot, buttonPoint)) {
 }
 ```
 
----
+### Q9. Why does `usecomputer` clamp coordinates at capture boundaries instead of allowing out-of-bounds clicks that might hit nearby UI?
 
-## Q9: Why clamping at boundaries prevents out-of-bounds clicks
+Because the project treats the screenshot as the safe action boundary.
 
-### Evidence from Repository
-- Coordinate mapping: "coordMap in the form captureX,captureY,captureWidth,captureHeight,imageWidth,imageHeight"
-- Clamping logic is implicit in `mapPointFromCoordMap` function
-- Use case: coordinates are restricted to the capture region
+An out-of-bounds click is not a harmless extension of the current screenshot. It is an action in a part of the UI the agent did not actually observe. That creates exactly the kind of mismatch that desktop automation should avoid. If the model points slightly above a button, or slightly past the right edge of a panel, allowing the click to spill into nearby UI could hit an unrelated control, including something destructive.
 
-### Answer
-Boundary clamping prevents **coordinate overflow and unintended clicks outside the monitored screen region**.
+Clamping is a conservative answer to that problem. It says: if the model overshoots, keep the action inside the captured rectangle. That keeps the click tied to the visible evidence the model was operating from.
 
-**Security & Reliability:**
-
-1. **Prevents Agent Miscalculation Exploits**
-   - Agent might calculate: button is at (x: 2000, y: 500) on a 1568px image
-   - Raw mapping: (2000/1568) × 1600 + 0 = 2038px (off-screen)
-   - **Without clamping**: mouse moves to x=2038 (outside visible screen)
-   - **With clamping**: `min(2038, 1600) = 1600` (rightmost edge of capture region)
-   - Prevents clicks from disappearing off-screen
-
-2. **Blocks Multi-Monitor Coordinate Injection**
-   - Multi-monitor setup: display 0 at [0,0] size 1600×900, display 1 at [1600,0] size 1600×900
-   - Agent intended to click on display 0 but miscalculates: x=2000
-   - **Without clamping**: click lands on display 1 (unscanned)
-   - **With clamping**: click lands at x=1600 (rightmost edge of display 0)
-   - Keeps click local to intended monitor
-
-3. **Prevents Clicking System UI Elements**
-   - macOS has menu bar at top (y: 0-25)
-   - If agent screenshot is [0,25] to [1600,925], clamping prevents:
-     - Agent passing y=-5 → clamped to y=25 (menu bar click prevented)
-   - Prevents accidental clicks on dock, system notifications, etc.
-
-4. **Atomic Boundary Enforcement**
-   - Clamping is deterministic: always picks max(min_bound, point, max_bound)
-   - No randomness, no off-by-one errors
-   - Same input always produces same clamped output
-
-5. **Prevents Integer Overflow at Zig Level**
-   - Zig receives pre-clamped coordinates within valid range
-   - Native code doesn't need runtime bounds checking (slight performance win)
-   - Reduces error handling complexity in C-ABI layer
+The tests make that intent clear as well. The coordinate mapping code is expected to snap overshoots back to the last valid pixel in the capture area, not to extrapolate past it.
 
 ### Mathematical Formula
 ```
@@ -628,64 +302,21 @@ clamped_x = max(captureX, min(real_x, captureX + captureWidth))
 # Ensures: captureX ≤ clamped_x ≤ captureX + captureWidth
 ```
 
----
 
-## Q10: Why multi-monitor support (display indices) is necessary
+### Q10. Why does `usecomputer` support multiple display indices (for multi-monitor setups) instead of assuming a single display?
 
-### Evidence from Repository
-- README: "For commands that accept `--display`, the index is 0-based: 0 = first display, 1 = second display, 2 = third display"
-- Example: `usecomputer screenshot ./shot.png --display 0 --json`
-- Coordinate mapping includes `desktopIndex` for which display was captured
+Because the code is operating in real desktop space, not in a simplified single-canvas world.
 
-### Answer
-Multi-monitor support ensures agents can **target specific displays in non-contiguous layouts** and prevents coordinate ambiguity.
+The repository explicitly enumerates active displays and keeps track of their bounds and indices. Screenshots report which desktop index they came from, and commands can target a specific display. On macOS, the code also resolves windows to the display with the greatest overlap. That matters because a modern desktop often has:
 
-**Multi-Monitor Scenarios:**
+*   more than one monitor,
+*   monitors with different origins,
+*   monitors arranged to the left or above the primary display,
+*   windows that live on or span different screens.
 
-1. **Non-Contiguous Display Layouts**
-   - Setup: Display 0 (laptop) at [0,0] 1600×900; Display 1 (external) at [2000, -400] 3840×2160
-   - Coordinates are discontinuous (gap from x=1600 to x=2000)
-   - Agent must specify `--display 1` to target external monitor
-   - **Without display index**: click at (x:3000, y:100) is ambiguous (which monitor?)
-   - **With display index**: agent knows exactly which monitor coordinate system applies
+If the tool simply assumed a single display starting at `(0, 0)`, then both screenshots and click mapping would break as soon as a user worked on a second monitor. The coordinate mapping tests already reflect this by covering non-zero and negative display origins.
 
-2. **Negative Coordinates**
-   - Setup: Display 0 (primary) at [0,0]; Display 1 rotated above at [500, -1080]
-   - Click at (y: -500) is valid for display 1 but nonsensical for display 0
-   - Display index resolves ambiguity: display 1's coordinate system supports negative y
-
-3. **Screenshot Capture Target Selection**
-   - Agent might need: "capture display 1 only (external monitor with full app window)"
-   - Command: `usecomputer screenshot ./external.png --display 1`
-   - Zig code: if --display specified, captures only that monitor; if null, captures all displays and returns "primary" one
-
-4. **Coordinate Mapping Anchoring**
-   - Each screenshot includes desktopIndex in JSON output
-   - Agent must map clicks using coordinates relative to the captured display
-   - If agent captured display 1 but clicks using display 0 coordinates, mismatch occurs
-   - **Explicit desktopIndex prevents this**: agent knows to use display 1's coordinate system
-
-5. **Prevents "Which Monitor?" Ambiguity**
-   - Setup: Two identical 1600×900 monitors
-   - Agent screenshot shows text "Welcome" at (400, 200)
-   - Without display index: agent can't know if (400, 200) is display 0 or 1
-   - With display index in JSON: `{ desktopIndex: 1, coordMap: "...", ... }`
-   - Agent clicks using display 1's coordinate system (not display 0)
-
-6. **Facilitates Multi-Display Workflows**
-   - Agent running on system with display 0 (work) and display 1 (monitoring dashboard)
-   - Workflow:
-     ```
-     1. screenshot display 0 → find "Send Email" button → click on display 0
-     2. screenshot display 1 → check dashboard updated → click on display 1
-     ```
-   - Without display indices: impossible to coordinate this workflow
-
-7. **Cross-Platform Display Numbering**
-   - macOS: `CGDisplayCreate(0)` (primary), `CGDisplayCreate(1)` (secondary)
-   - Linux X11: `:0` (primary), `:1` (secondary)
-   - Windows: `Display 0` (primary), `Display 1` (secondary)
-   - usecomputer abstracts these as 0-based indices for consistency
+In short, multi-display support is not an optional convenience here. It is part of making the automation coordinates mean the same thing on real machines that they mean in the code.
 
 ### Related Code Pattern
 ```bash
@@ -711,56 +342,12 @@ const screenshot = await usecomputer.screenshot({
 // Agent uses screenshot.coordMap to translate clicks to display 1 coordinates
 ```
 
----
+## 3. Findings and Conclusion
 
-## Summary Table: Design Decisions & Rationale
+The main finding from the repository is that `usecomputer` is built around controlled explicitness. The project avoids "smart" generic interfaces in favor of fixed native operations, fixed result shapes, and fixed coordinate handling rules. That makes the system less flexible in a superficial sense, but much safer for the kind of agent-driven automation it is designed for.
 
-| Question | Design Decision | Primary Benefit | Secondary Benefit |
-|----------|-----------------|-----------------|-------------------|
-| Q1 | Null normalization in bridge.ts | Type boundary safety | Prevents hidden allocations |
-| Q2 | Centralized unwrap* helpers | Consistent error semantics | Prevents partial failures |
-| Q3 | Proportional scaling + clamping | Out-of-bounds click prevention | Multi-monitor safety |
-| Q4 | 18 distinct methods | Compile-time type safety | Prevents command injection |
-| Q5 | Native Zig binary | Hardware access capability | Cross-platform compilation |
-| Q6 | Dual CLI + library interfaces | No subprocess overhead | Shared argument parsing |
-| Q7 | Screenshot scaling (1568px) + Kitty | AI token budget optimization | Zero context token overhead |
-| Q8 | Debug visualization (red marker) | Validates coordinates before clicks | Catches mapping errors early |
-| Q9 | Boundary clamping | Prevents off-screen clicks | Blocks system UI injection |
-| Q10 | Multi-monitor display indices | Non-contiguous layout support | Resolves coordinate ambiguity |
+The most important theme across the codebase is that screenshots and actions are treated as one closed loop. Screenshots are scaled to practical sizes, their capture bounds are returned as a coord-map, pointer commands can map back into real desktop space, and `debug-point` exists to verify that mapping visually. Once that design is understood, many of the individual implementation choices make sense immediately: null normalization, clamped coordinate transforms, method-per-operation exports, and support for inline screenshot transport all serve that same loop.
+
+So the repository is best understood not just as a desktop automation library, but as an execution layer for computer-use agents. Its architecture is shaped less by abstract API design and more by the practical realities of cross-platform input synthesis, screenshot alignment, and failure containment. That is why the code consistently favors explicit contracts over dynamic behavior, and it is also why the project feels more reliable than a looser automation wrapper would.
 
 ---
-
-## Architecture Principles Demonstrated
-
-The usecomputer repository exemplifies five key architectural principles:
-
-1. **Type Safety Over Runtime Checks**
-   - Method-per-operation (Q4) + null normalization (Q1) = compile-time guarantees
-
-2. **Explicit Boundaries**
-   - Clamping (Q9) + display indices (Q10) = no ambiguous coordinates
-
-3. **Fail-Fast Over Silent Failures**
-   - Centralized unwrap (Q2) + debug visualization (Q8) = errors caught early
-
-4. **Performance for AI Workloads**
-   - Screenshot scaling (Q7) + no subprocess overhead (Q6) = low latency
-
-5. **Platform Independence via Native Code**
-   - Zig binary (Q5) + cross-platform support (Q10) = single codebase, all platforms
-
----
-
-## References & Further Reading
-
-- **Repository:** https://github.com/remorses/usecomputer
-- **Latest Release:** usecomputer@0.1.1 (March 24, 2026)
-- **Related Projects:** 
-  - OpenCode (desktop automation framework)
-  - Kimaki (agent orchestration platform)
-  - Playwriter (browser automation with Playwright)
-
----
-
-*Report Generated: 2026-04-02*  
-*Analysis Method: Repository documentation review + architectural pattern inference*
