@@ -57,6 +57,8 @@ const screenshot = await usecomputer.screenshot({
 })
 ```
 
+References: [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [src/bridge.ts](https://github.com/remorses/usecomputer/blob/main/src/bridge.ts), [src/native-lib.ts](https://github.com/remorses/usecomputer/blob/main/src/native-lib.ts)
+
 ### Q2. `usecomputer` normalizes all mouse button operations through `unwrap*` helper functions instead of having each method handle errors directly. Why does this centralized error pattern prevent user code from mishandling failures?
 
 The big advantage is that it prevents partial handling and silent failure.
@@ -87,6 +89,8 @@ await usecomputer.click({
 // click() wraps Zig's error union; if native click fails, throws
 ```
 
+References: [src/bridge.ts](https://github.com/remorses/usecomputer/blob/main/src/bridge.ts), [src/lib.ts](https://github.com/remorses/usecomputer/blob/main/src/lib.ts), [zig/src/lib.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/lib.zig)
+
 ### Q3. The `CoordMap` coordinate transformation uses proportional scaling with clamping rather than linear interpolation. Why does proportional scaling prevent AI agents from clicking outside the capture region?
 
 Because the screenshot the agent sees is not always the same size as the real captured desktop region.
@@ -114,6 +118,8 @@ const point = usecomputer.mapPointFromCoordMap({
 await usecomputer.click({ point, button: 'left', count: 1 })
 ```
 
+References: [src/coord-map.ts](https://github.com/remorses/usecomputer/blob/main/src/coord-map.ts), [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [src/coord-map.test.ts](https://github.com/remorses/usecomputer/blob/main/src/coord-map.test.ts)
+
 ### Q4. `usecomputer` implements 18 distinct methods (`click`, `drag`, `type`, `scroll`, etc.) as separate exported functions instead of a single `execute` method with a command string. Why does method-per-operation improve safety over dynamic dispatch?
 
 Method-per-operation is safer because it makes the interface explicit, typed, and narrow.
@@ -138,6 +144,8 @@ await usecomputer.scroll({ direction: 'up', amount: 5, at: null })
 // Each is a distinct function with its own type contract
 // All errors are thrown consistently (via unwrap pattern from Q2)
 ```
+
+References: [src/lib.ts](https://github.com/remorses/usecomputer/blob/main/src/lib.ts), [src/native-lib.ts](https://github.com/remorses/usecomputer/blob/main/src/native-lib.ts), [zig/src/lib.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/lib.zig)
 
 ### Q5. Why does `usecomputer` require a native Zig binary (built via `pnpm build:native` or `zig build`) instead of implementing desktop automation in pure JavaScript?
 
@@ -181,6 +189,8 @@ That would be much harder to do cleanly if the real implementation lived in Java
 └─────────────────────────────────────────┘
 ```
 
+References: [build.zig](https://github.com/remorses/usecomputer/blob/main/build.zig), [zig/src/lib.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/lib.zig), [src/bin.ts](https://github.com/remorses/usecomputer/blob/main/src/bin.ts)
+
 ### Q6. Why does `usecomputer` include both CLI and JavaScript library interfaces instead of just exposing a single API?
 
 Because the repository is serving two different usage patterns that both matter.
@@ -221,6 +231,8 @@ await usecomputer.click({
 })
 ```
 
+References: [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [src/bin.ts](https://github.com/remorses/usecomputer/blob/main/src/bin.ts), [src/lib.ts](https://github.com/remorses/usecomputer/blob/main/src/lib.ts)
+
 ### Q7. Why does `usecomputer` include both screenshot scaling and Kitty Graphics Protocol support instead of just returning raw screenshots?
 
 Because the repository is optimized for agent loops, and raw screenshots are not enough for that workflow.
@@ -244,6 +256,8 @@ AGENT_GRAPHICS=kitty usecomputer screenshot --json
 # { path: "...", coordMap: "...", agentGraphics: true }
 # Model sees rendered image directly
 ```
+
+References: [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [zig/src/main.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/main.zig), [zig/src/kitty-graphics.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/kitty-graphics.zig)
 
 
 ### Q8. Why does `usecomputer` provide a "debug visualization" mode instead of trusting agents to validate clicks correctly?
@@ -278,6 +292,8 @@ if (isMarkerOnTarget(debugScreenshot, buttonPoint)) {
 }
 ```
 
+References: [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [zig/src/main.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/main.zig), [zig/src/lib.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/lib.zig)
+
 ### Q9. Why does `usecomputer` clamp coordinates at capture boundaries instead of allowing out-of-bounds clicks that might hit nearby UI?
 
 Because the project treats the screenshot as the safe action boundary.
@@ -301,6 +317,8 @@ clamped_x = max(captureX, min(real_x, captureX + captureWidth))
 
 # Ensures: captureX ≤ clamped_x ≤ captureX + captureWidth
 ```
+
+References: [src/coord-map.ts](https://github.com/remorses/usecomputer/blob/main/src/coord-map.ts), [src/coord-map.test.ts](https://github.com/remorses/usecomputer/blob/main/src/coord-map.test.ts)
 
 
 ### Q10. Why does `usecomputer` support multiple display indices (for multi-monitor setups) instead of assuming a single display?
@@ -341,6 +359,8 @@ const screenshot = await usecomputer.screenshot({
 // screenshot.desktopIndex === 1 (confirms display 1 was captured)
 // Agent uses screenshot.coordMap to translate clicks to display 1 coordinates
 ```
+
+References: [README.md](https://github.com/remorses/usecomputer/blob/main/README.md), [zig/src/lib.zig](https://github.com/remorses/usecomputer/blob/main/zig/src/lib.zig), [src/coord-map.test.ts](https://github.com/remorses/usecomputer/blob/main/src/coord-map.test.ts)
 
 ## 3. Findings and Conclusion
 
